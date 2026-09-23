@@ -12,7 +12,7 @@ from gtts import gTTS
 # Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from services.sarvam import extract_intent_from_transcript, transcribe_audio
+from sarvam import extract_intent_from_transcript, transcribe_audio
 from streamlit_mic_recorder import mic_recorder
 
 # 1. Page Configuration & Custom Theme
