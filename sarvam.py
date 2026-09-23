@@ -1,8 +1,8 @@
 import httpx
 import re
 import json
-from app.config import settings
-from app.schemas import VoiceTransactionIntent, TransactionType
+from config import settings
+from schemas import VoiceTransactionIntent, TransactionType
 
 # Mapping Devanagari numerals to standard digits
 DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
