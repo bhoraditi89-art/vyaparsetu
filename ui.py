@@ -185,7 +185,7 @@ with col_input:
         if audio_record:
             st.audio(audio_record["bytes"])
             with st.spinner("Processing speech via Sarvam ASR..."):
-                transcript = asyncio.run(transcribe_audio(audio_record["bytes"], lang_code))
+                transcript = transcribe_audio(audio_record["bytes"], lang_code)
                 st.success(f"Recognized: **{transcript}**")
     else:
         sample = st.selectbox(
