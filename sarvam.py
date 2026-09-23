@@ -1,122 +1,149 @@
-import httpx
-import re
+import os
 import json
-from config import settings
-from schemas import VoiceTransactionIntent, TransactionType
+import logging
+import httpx
 
-# Mapping Devanagari numerals to standard digits
-DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def transcribe_audio(audio_bytes: bytes, language_code: str = "mr-IN") -> str:
-    """Sends recorded audio to Sarvam STT (saarika:v2) if API key exists."""
-    if not settings.SARVAM_API_KEY:
-        return "सचिनला 450 रुपयांची साखर उधारीवर दिली"
+# --- Safe Root-Level Imports ---
+try:
+    from config import settings
+    SARVAM_API_KEY = getattr(settings, "SARVAM_API_KEY", os.getenv("SARVAM_API_KEY", ""))
+except ImportError:
+    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 
-    url = "https://api.sarvam.ai/speech-to-text"
-    headers = {"api-subscription-key": settings.SARVAM_API_KEY}
-    files = {"file": ("recording.wav", audio_bytes, "audio/wav")}
-    data = {"language_code": language_code, "model": "saarika:v2"}
+try:
+    from schema import IntentExtractionResult
+except ImportError:
+    from pydantic import BaseModel, Field
+    from typing import Optional, List
+
+    class IntentExtractionResult(BaseModel):
+        customer_name: Optional[str] = Field(default=None, description="Name of the customer/merchant")
+        amount: Optional[float] = Field(default=None, description="Transaction amount")
+        action: Optional[str] = Field(default="UNKNOWN", description="Action type: CREDIT, DEBIT, REMINDER, UPI_PAY")
+        language: Optional[str] = Field(default="hi-IN", description="Detected language code")
+        raw_text: Optional[str] = Field(default="", description="Original transcript")
+
+
+SARVAM_BASE_URL = "https://api.sarvam.ai"
+
+
+def transcribe_audio(audio_bytes: bytes, language_code: str = "hi-IN", model: str = "saaras:v1") -> str:
+    """
+    Transcribes voice input using Sarvam AI Speech-to-Text API.
+    """
+    if not SARVAM_API_KEY:
+        logger.warning("SARVAM_API_KEY not configured. Returning fallback mock response.")
+        return "रमेश ने 500 रुपये उधार लिए"
+
+    url = f"{SARVAM_BASE_URL}/speech-to-text"
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY
+    }
+    files = {
+        "file": ("audio.wav", audio_bytes, "audio/wav")
+    }
+    data = {
+        "model": model,
+        "language_code": language_code
+    }
 
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            response = await client.post(url, headers=headers, files=files, data=data)
-            if response.status_code == 200:
-                return response.json().get("transcript", "")
-    except Exception:
-        pass
-    return "सचिनला 450 रुपयांची साखर उधारीवर दिली"
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(url, headers=headers, files=files, data=data)
+            response.raise_for_status()
+            result = response.json()
+            return result.get("transcript", "")
+    except Exception as e:
+        logger.error(f"Error in Sarvam STT transcription: {e}")
+        return ""
 
-async def extract_intent_from_transcript(transcript: str, language_code: str = "hi-IN") -> VoiceTransactionIntent:
-    """Dual-path extraction: Cloud Sarvam LLM with rule-based fallback."""
-    # Normalize Devanagari numerals to standard digits
-    normalized_text = transcript.translate(DEVANAGARI_DIGITS).strip()
 
-    # 1. Cloud LLM Extraction
-    if settings.SARVAM_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                prompt = f"""
-                You are a Marathi/Hindi/English merchant accounting parser.
-                Extract transaction details from this merchant transcript:
-                "{normalized_text}"
+def extract_intent_from_transcript(transcript: str, language_code: str = "hi-IN") -> IntentExtractionResult:
+    """
+    Extracts structured Khata transaction details (Customer, Amount, Credit/Debit)
+    from voice transcript using Sarvam AI LLM completion.
+    """
+    if not transcript:
+        return IntentExtractionResult(raw_text="", action="UNKNOWN")
 
-                Output strict JSON:
-                {{
-                    "customer_name": "string",
-                    "customer_phone": null,
-                    "amount": 0.0,
-                    "item_description": "string or null",
-                    "transaction_type": "CREDIT" or "PAYMENT"
-                }}
-                """
-                res = await client.post(
-                    "https://api.sarvam.ai/v1/chat/completions",
-                    headers={"api-subscription-key": settings.SARVAM_API_KEY},
-                    json={
-                        "model": "sarvam-2b",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.0
-                    }
-                )
-                if res.status_code == 200:
-                    raw = res.json()["choices"][0]["message"]["content"]
-                    match = re.search(r"\{.*\}", raw, re.DOTALL)
-                    if match:
-                        data = json.loads(match.group(0))
-                        return VoiceTransactionIntent(
-                            customer_name=data.get("customer_name", "Customer").strip(),
-                            customer_phone=data.get("customer_phone"),
-                            amount=float(data.get("amount", 0.0)),
-                            item_description=data.get("item_description"),
-                            transaction_type=TransactionType(data.get("transaction_type", "CREDIT")),
-                            detected_language=language_code
-                        )
-        except Exception:
-            pass
+    if not SARVAM_API_KEY:
+        logger.warning("SARVAM_API_KEY not found. Running rule-based local intent extraction fallback.")
+        return _fallback_rule_extraction(transcript)
 
-    # 2. Resilient Vernacular Regex Engine
-    amount_match = re.search(r"(\d+(?:\.\d+)?)", normalized_text)
-    amount = float(amount_match.group(1)) if amount_match else 0.0
-
-    # Classification
-    payment_terms = ["जमा", "नकद", "paid", "received", "रोख", "मिळाले", "aale", "diya"]
-    credit_terms = ["उधारी", "उधारीवर", "बाकी", "credit", "udhaar", "dile", "दिले", "baaki"]
-
-    tx_type = TransactionType.CREDIT
-    if any(k in normalized_text.lower() for k in payment_terms):
-        tx_type = TransactionType.PAYMENT
-    elif any(k in normalized_text.lower() for k in credit_terms):
-        tx_type = TransactionType.CREDIT
-
-    # Name extraction
-    words = re.findall(r"\b[\w\u0900-\u097F]+\b", normalized_text)
-    stop_words = {
-        "रुपये", "rupaye", "rs", "उधारी", "तेल", "पैसे", "दिले", "घेतले", 
-        "साखर", "नकद", "जमा", "बाकी", "ला", "ने", "कडून", "dile", "aale"
+    url = f"{SARVAM_BASE_URL}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "api-subscription-key": SARVAM_API_KEY
     }
-    customer_name = "Customer"
-    for w in words:
-        clean = re.sub(r"(ला|ने|कडून|कडुन|se|ko)$", "", w)
-        if clean.lower() not in stop_words and not clean.isdigit() and len(clean) >= 3:
-            customer_name = clean
-            break
 
-    # Item extraction
-    item_corpus = {
-        "तेल": "Oil", "साखर": "Sugar", "डाळ": "Pulses/Dal", "गहू": "Wheat",
-        "तांदूळ": "Rice", "दूध": "Milk", "चहा": "Tea Powder", "साबण": "Soap"
+    system_prompt = (
+        "You are an AI assistant for Indian small merchants (VyaparSetu Khata Ledger). "
+        "Extract transaction details from the given merchant voice transcript into strict JSON format with keys: "
+        "'customer_name' (string or null), 'amount' (number or null), "
+        "'action' (must be one of: 'CREDIT', 'DEBIT', 'REMINDER', 'UPI_PAY', or 'UNKNOWN'). "
+        "Respond ONLY with valid raw JSON."
+    )
+
+    payload = {
+        "model": "sarvam-2b",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Transcript: {transcript}"}
+        ],
+        "temperature": 0.1
     }
-    detected_item = "General Khata"
-    for vernacular, translated in item_corpus.items():
-        if vernacular in normalized_text:
-            detected_item = f"{vernacular} ({translated})"
-            break
 
-    return VoiceTransactionIntent(
-        customer_name=customer_name,
-        customer_phone=None,
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            
+            # Clean markdown JSON block formatting if present
+            cleaned_content = content.strip()
+            if cleaned_content.startswith("```"):
+                cleaned_content = cleaned_content.split("```")[1]
+                if cleaned_content.startswith("json"):
+                    cleaned_content = cleaned_content[4:]
+            cleaned_content = cleaned_content.strip()
+
+            parsed = json.loads(cleaned_content)
+            return IntentExtractionResult(
+                customer_name=parsed.get("customer_name"),
+                amount=float(parsed.get("amount")) if parsed.get("amount") else None,
+                action=parsed.get("action", "UNKNOWN"),
+                language=language_code,
+                raw_text=transcript
+            )
+    except Exception as e:
+        logger.error(f"Sarvam LLM intent extraction failed: {e}. Using fallback parser.")
+        return _fallback_rule_extraction(transcript)
+
+
+def _fallback_rule_extraction(text: str) -> IntentExtractionResult:
+    """
+    Lightweight rule-based fallback when offline or during missing API key conditions.
+    """
+    import re
+    amounts = re.findall(r"\b\d+(?:\.\d+)?\b", text)
+    amount = float(amounts[0]) if amounts else None
+
+    action = "UNKNOWN"
+    lower_text = text.lower()
+    if any(word in lower_text for word in ["उधार", "दिया", "debit", "gave", "khata"]):
+        action = "DEBIT"
+    elif any(word in lower_text for word in ["जमा", "मिला", "credit", "received", "aaya"]):
+        action = "CREDIT"
+    elif any(word in lower_text for word in ["remind", "याद", "bhejo", "request"]):
+        action = "REMINDER"
+
+    return IntentExtractionResult(
+        customer_name="Merchant Customer",
         amount=amount,
-        item_description=detected_item,
-        transaction_type=tx_type,
-        detected_language=language_code
+        action=action,
+        raw_text=text
     )
