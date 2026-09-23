@@ -1,5 +1,6 @@
 streamlit
 streamlit-mic-recorder
+httpx
 gTTS
 qrcode
 pandas
