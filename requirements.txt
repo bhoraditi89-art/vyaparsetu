@@ -1,0 +1,7 @@
+streamlit
+streamlit-mic-recorder
+gTTS
+qrcode
+pandas
+pydantic
+requests
