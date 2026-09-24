@@ -1,9 +1,9 @@
 # 🏪 VyaparSetu (व्यापारसेतु)
 ### AI-Powered Vernacular Voice Ledger & Automated UPI Payment Collections for Indian Merchants
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Sarvam AI](https://img.shields.io/badge/Powered%20By-Sarvam%20AI-orange.svg)](https://www.sarvam.ai/)
+[![Streamlit](https://img.shields.io/badge/Built%20With-Streamlit-red.svg)](https://streamlit.io/)
 
 ---
 
