@@ -1,24 +1,30 @@
 import os
 import json
 import logging
+import re
 import httpx
+import streamlit as st
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Safe Root-Level Imports ---
+# --- Safe API Key Loading (Streamlit Secrets + Env fallback) ---
+SARVAM_API_KEY = ""
 try:
-    from config import settings
-    SARVAM_API_KEY = getattr(settings, "SARVAM_API_KEY", os.getenv("SARVAM_API_KEY", ""))
-except ImportError:
+    if "SARVAM_API_KEY" in st.secrets:
+        SARVAM_API_KEY = st.secrets["SARVAM_API_KEY"]
+except Exception:
+    pass
+
+if not SARVAM_API_KEY:
     SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 
+# --- Schema Import with Safe Fallback ---
 try:
     from schema import IntentExtractionResult
 except ImportError:
     from pydantic import BaseModel, Field
-    from typing import Optional, List
+    from typing import Optional
 
     class IntentExtractionResult(BaseModel):
         customer_name: Optional[str] = Field(default=None, description="Name of the customer/merchant")
@@ -27,17 +33,21 @@ except ImportError:
         language: Optional[str] = Field(default="hi-IN", description="Detected language code")
         raw_text: Optional[str] = Field(default="", description="Original transcript")
 
-
 SARVAM_BASE_URL = "https://api.sarvam.ai"
 
 
 def transcribe_audio(audio_bytes: bytes, language_code: str = "hi-IN", model: str = "saaras:v1") -> str:
     """
     Transcribes voice input using Sarvam AI Speech-to-Text API.
+    Displays clear UI errors if credentials or requests fail.
     """
+    if not audio_bytes:
+        st.warning("No audio recorded. Please try speaking into the microphone again.")
+        return ""
+
     if not SARVAM_API_KEY:
-        logger.warning("SARVAM_API_KEY not configured. Returning fallback mock response.")
-        return "रमेश ने 500 रुपये उधार लिए"
+        st.error("SARVAM_API_KEY not found! Please add SARVAM_API_KEY to Streamlit Secrets or Environment Variables.")
+        return ""
 
     url = f"{SARVAM_BASE_URL}/speech-to-text"
     headers = {
@@ -54,11 +64,14 @@ def transcribe_audio(audio_bytes: bytes, language_code: str = "hi-IN", model: st
     try:
         with httpx.Client(timeout=30.0) as client:
             response = client.post(url, headers=headers, files=files, data=data)
-            response.raise_for_status()
+            if response.status_code != 200:
+                st.error(f"Sarvam STT API Error ({response.status_code}): {response.text}")
+                return ""
+            
             result = response.json()
             return result.get("transcript", "")
     except Exception as e:
-        logger.error(f"Error in Sarvam STT transcription: {e}")
+        st.error(f"Sarvam audio transcription failed: {e}")
         return ""
 
 
@@ -71,7 +84,7 @@ def extract_intent_from_transcript(transcript: str, language_code: str = "hi-IN"
         return IntentExtractionResult(raw_text="", action="UNKNOWN")
 
     if not SARVAM_API_KEY:
-        logger.warning("SARVAM_API_KEY not found. Running rule-based local intent extraction fallback.")
+        st.warning("Running offline rule-based parser (API key missing).")
         return _fallback_rule_extraction(transcript)
 
     url = f"{SARVAM_BASE_URL}/chat/completions"
@@ -82,9 +95,9 @@ def extract_intent_from_transcript(transcript: str, language_code: str = "hi-IN"
 
     system_prompt = (
         "You are an AI assistant for Indian small merchants (VyaparSetu Khata Ledger). "
-        "Extract transaction details from the given merchant voice transcript into strict JSON format with keys: "
+        "Extract transaction details from the merchant voice transcript into strict JSON with keys: "
         "'customer_name' (string or null), 'amount' (number or null), "
-        "'action' (must be one of: 'CREDIT', 'DEBIT', 'REMINDER', 'UPI_PAY', or 'UNKNOWN'). "
+        "'action' (one of: 'CREDIT', 'DEBIT', 'REMINDER', 'UPI_PAY', or 'UNKNOWN'). "
         "Respond ONLY with valid raw JSON."
     )
 
@@ -100,18 +113,21 @@ def extract_intent_from_transcript(transcript: str, language_code: str = "hi-IN"
     try:
         with httpx.Client(timeout=30.0) as client:
             response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
+            if response.status_code != 200:
+                st.warning(f"Sarvam LLM returned status {response.status_code}. Using local rule fallback.")
+                return _fallback_rule_extraction(transcript)
+
             content = response.json()["choices"][0]["message"]["content"]
             
-            # Clean markdown JSON block formatting if present
-            cleaned_content = content.strip()
-            if cleaned_content.startswith("```"):
-                cleaned_content = cleaned_content.split("```")[1]
-                if cleaned_content.startswith("json"):
-                    cleaned_content = cleaned_content[4:]
-            cleaned_content = cleaned_content.strip()
+            # Clean markdown codeblocks if returned
+            cleaned = content.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
 
-            parsed = json.loads(cleaned_content)
+            parsed = json.loads(cleaned)
             return IntentExtractionResult(
                 customer_name=parsed.get("customer_name"),
                 amount=float(parsed.get("amount")) if parsed.get("amount") else None,
@@ -120,23 +136,22 @@ def extract_intent_from_transcript(transcript: str, language_code: str = "hi-IN"
                 raw_text=transcript
             )
     except Exception as e:
-        logger.error(f"Sarvam LLM intent extraction failed: {e}. Using fallback parser.")
+        logger.error(f"Intent extraction error: {e}. Defaulting to rule fallback.")
         return _fallback_rule_extraction(transcript)
 
 
 def _fallback_rule_extraction(text: str) -> IntentExtractionResult:
     """
-    Lightweight rule-based fallback when offline or during missing API key conditions.
+    Lightweight rule-based fallback when offline or during unexpected API responses.
     """
-    import re
     amounts = re.findall(r"\b\d+(?:\.\d+)?\b", text)
     amount = float(amounts[0]) if amounts else None
 
     action = "UNKNOWN"
     lower_text = text.lower()
-    if any(word in lower_text for word in ["उधार", "दिया", "debit", "gave", "khata"]):
+    if any(word in lower_text for word in ["उधार", "दिया", "debit", "gave", "khata", "उधारी"]):
         action = "DEBIT"
-    elif any(word in lower_text for word in ["जमा", "मिला", "credit", "received", "aaya"]):
+    elif any(word in lower_text for word in ["जमा", "मिला", "credit", "received", "aaya", "नकद"]):
         action = "CREDIT"
     elif any(word in lower_text for word in ["remind", "याद", "bhejo", "request"]):
         action = "REMINDER"
