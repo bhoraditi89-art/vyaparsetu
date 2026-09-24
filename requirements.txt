@@ -1,8 +1,8 @@
 streamlit
 streamlit-mic-recorder
 httpx
-gTTS
-qrcode
-pandas
 pydantic
-requests
+pandas
+qrcode
+pillow
+gtts
