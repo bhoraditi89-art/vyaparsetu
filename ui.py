@@ -32,12 +32,17 @@ except ImportError:
         language: Optional[str] = Field(default="hi-IN")
         raw_text: Optional[str] = Field(default="")
 
-# Direct root imports for sarvam services
-from sarvam import (
-    extract_intent_from_transcript,
-    transcribe_audio,
-    generate_voice_reminder
-)
+# Direct root imports for sarvam services with safety fallback
+try:
+    from sarvam import (
+        extract_intent_from_transcript,
+        transcribe_audio,
+        generate_voice_reminder
+    )
+except ImportError:
+    from sarvam import extract_intent_from_transcript, transcribe_audio
+    def generate_voice_reminder(text: str, language_code: str = "hi-IN") -> bytes:
+        return b""
 
 # --- Page Setup ---
 st.set_page_config(
